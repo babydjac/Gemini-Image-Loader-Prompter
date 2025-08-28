@@ -39,7 +39,7 @@ Here's the node in action, showcasing its clean interface and powerful features.
     ```
 2.  Clone this repository:
     ```bash
-    git clone <your-repo-url-here>
+    git clone https://github.com/babydjac/Gemini-Image-Loader-Prompter.git
     ```
 3.  Restart ComfyUI.
 
@@ -55,7 +55,7 @@ Here's the node in action, showcasing its clean interface and powerful features.
 
 ## ⚠️ Dependencies
 
-This node relies on the `comfy_api_nodes` infrastructure, which appears to be part of your existing ComfyUI environment. Ensure it is properly installed.
+This node relies on the `comfy_api_nodes` infrastructure, which should be part of your existing ComfyUI environment. Ensure it is properly installed.
 
 ## 🔑 API Key
 

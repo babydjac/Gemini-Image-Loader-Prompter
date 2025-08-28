@@ -15,21 +15,21 @@ Load an image, and instantly get a resized and VAE-encoded version, plus a highl
 - **Optional VAE Encoding**: Connect a VAE to automatically encode the resized image into a latent representation.
 - **Live Preview**: Shows a preview of the final resized image directly in the node.
 
-## 📸 Screenshots
+## 📸 Examples
 
-Here's the node in action, showcasing its clean interface and powerful features.
+Here are examples of prompts generated for different models:
 
-*Node Interface and Options:*
-![Screenshot of the Gemini Image Loader node interface](Screenshot%202025-08-27%20at%2022.16.40.png)
+*Example for Stable Diffusion 1.5:*
+![Example for Stable Diffusion 1.5](1.5Ex.jpeg)
 
-*Prompt Style Selection:*
-![Dropdown menu showing the different prompt styles](Screenshot%202025-08-27%20at%2022.17.03.png)
+*Example for Flux:*
+![Example for Flux](FluxEx.jpeg)
 
-*Resize and VAE options:*
-![Close-up of the resize and VAE inputs](Screenshot%202025-08-27%20at%2022.17.34.png)
+*Example for Pony:*
+![Example for Pony](PonyEx.jpeg)
 
-*Example Workflow:*
-![Node connected in an example workflow](Screenshot%202025-08-27%20at%2022.18.08.png)
+*Example for SDXL:*
+![Example for SDXL](SDXLEx.jpeg)
 
 ## ⚙️ Installation
 

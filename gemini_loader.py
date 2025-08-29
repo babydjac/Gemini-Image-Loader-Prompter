@@ -47,8 +47,16 @@ resample_filters = {
     'bicubic': 3,
 }
 
-def tensor2pil(image):
-    return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+def tensor2pil(image: torch.Tensor) -> Image.Image:
+    arr = image.detach().cpu().numpy()
+    # Expect [B,H,W,C] or [H,W,C]; select first batch if present, do not squeeze H/W
+    if arr.ndim == 4:
+        arr = arr[0]
+    # If channels-first, move to HWC
+    if arr.ndim == 3 and arr.shape[0] in (3, 4) and arr.shape[-1] not in (3, 4):
+        arr = np.moveaxis(arr, 0, -1)
+    arr = np.clip(255.0 * arr, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
 
 def pil2tensor(image):
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
@@ -99,9 +107,14 @@ class GeminiImageLoader:
         
         prompt_styles = ["PONY", "FLUX", "1.5", "SDXL"]
 
+        # Discover simple video files in input dir by extension
+        video_exts = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".mpg", ".mpeg")
+        video_files = sorted([f for f in files if f.lower().endswith(video_exts)])
+
         return {
             "required": {
-                "image": (sorted(image_files), {"image_upload": True}),
+                "load_mode": (["image", "video"], {"default": "image", "tooltip": "Choose whether to load from an image file or extract a frame from a video."}),
+                "image": (sorted(image_files), {"image_upload": True, "tooltip": "Image file to load when in image mode."}),
                 "model": (
                     [model.value for model in GeminiModel],
                     {
@@ -126,7 +139,13 @@ class GeminiImageLoader:
                 ),
             },
             "optional": {
-                "vae": ("VAE",)
+                "vae": ("VAE",),
+                "video": (video_files, {"video_upload": True, "file_upload": True, "tooltip": "Video file to load when in video mode.", "default": video_files[0] if video_files else None}),
+                "video_frame": ("INT", {"default": 0, "min": 0, "step": 1, "tooltip": "Zero-based index of frame to extract in video mode."}),
+                "emit_all_frames": ("BOOLEAN", {"default": False, "label_on": "All Frames", "label_off": "Selected Only", "tooltip": "When enabled, outputs every frame as resized IMAGEs. May be slow for long videos."}),
+                "frame_stride": ("INT", {"default": 1, "min": 1, "step": 1, "tooltip": "Keep every Nth frame when emitting all frames."}),
+                "max_frames": ("INT", {"default": 0, "min": 0, "step": 1, "tooltip": "Limit number of frames when emitting all frames (0 = no limit)."}),
+                "show_video_panel": ("BOOLEAN", {"default": False, "label_on": "Panel On", "label_off": "Panel Off", "tooltip": "Show a floating video player when in video mode."}),
             },
             "hidden": {
                 "auth_token": "AUTH_TOKEN_COMFY_ORG",
@@ -135,10 +154,11 @@ class GeminiImageLoader:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "LATENT")
-    RETURN_NAMES = ("image", "mask", "prompt", "latent")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "LATENT", "INT", "FLOAT", "IMAGE")
+    RETURN_NAMES = ("image", "mask", "prompt", "latent", "total_frames", "fps", "frames")
     FUNCTION = "load_and_generate_prompt"
-    CATEGORY = "Gemini"
+    CATEGORY = "api node/image/Gemini"
+    OUTPUT_IS_LIST = (False, False, False, False, False, False, True)
 
     def create_image_parts(self, image_input: torch.Tensor) -> list[GeminiPart]:
         image_parts: list[GeminiPart] = []
@@ -167,7 +187,10 @@ class GeminiImageLoader:
 
     async def load_and_generate_prompt(
         self,
+        load_mode: str,
         image: str,
+        video: str | None,
+        video_frame: int,
         model: str,
         prompt_style: str,
         nsfw: bool,
@@ -179,34 +202,101 @@ class GeminiImageLoader:
         vae = None,
         **kwargs,
     ) -> dict:
-        # 1. Load the image from file
-        image_path = folder_paths.get_annotated_filepath(image)
-        pil_img = Image.open(image_path)
-        
-        output_images, output_masks = [], []
-        for i in ImageSequence.Iterator(pil_img):
-            i = ImageOps.exif_transpose(i)
-            if i.mode == 'I':
-                i = i.point(lambda i: i * (1 / 255))
-            image_tensor_part = i.convert("RGB")
-            image_tensor_part = np.array(image_tensor_part).astype(np.float32) / 255.0
-            image_tensor_part = torch.from_numpy(image_tensor_part)[None,]
-            
-            if 'A' in i.getbands():
-                mask_part = np.array(i.getchannel('A')).astype(np.float32) / 255.0
-                mask_part = 1. - torch.from_numpy(mask_part)
-            else:
-                mask_part = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
-            
-            output_images.append(image_tensor_part)
-            output_masks.append(mask_part.unsqueeze(0))
+        # 1. Acquire image tensor(s)
+        total_frames_out: int = 1
+        fps_out: float = 0.0
+        all_frames_resized: list[torch.Tensor] = []
+        if load_mode == "video":
+            if not video:
+                raise Exception("No video selected. Choose a file in 'video'.")
+            video_path = folder_paths.get_annotated_filepath(video)
+            # Try OpenCV first, then imageio as a fallback
+            frame_np = None
+            # Gather metadata
+            try:
+                import cv2
+                cap_meta = cv2.VideoCapture(video_path)
+                try:
+                    cnt = int(cap_meta.get(cv2.CAP_PROP_FRAME_COUNT))
+                    if cnt and cnt > 0:
+                        total_frames_out = cnt
+                except Exception:
+                    pass
+                try:
+                    fps_val = float(cap_meta.get(cv2.CAP_PROP_FPS))
+                    if fps_val and fps_val > 0:
+                        fps_out = fps_val
+                except Exception:
+                    pass
+                cap_meta.release()
+            except Exception:
+                pass
+            try:
+                import cv2
+                cap = cv2.VideoCapture(video_path)
+                # Set frame position if supported
+                if video_frame > 0:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(video_frame))
+                ok, frame = cap.read()
+                cap.release()
+                if ok and frame is not None:
+                    frame_np = frame[:, :, ::-1]  # BGR->RGB
+            except Exception:
+                frame_np = None
+            if frame_np is None:
+                try:
+                    import imageio.v2 as iio
+                    with iio.get_reader(video_path) as reader:
+                        try:
+                            total_frames_out = reader.get_length()
+                        except Exception:
+                            pass
+                        try:
+                            md = reader.get_meta_data()
+                            fps_md = md.get("fps") or md.get("framerate")
+                            if fps_md:
+                                fps_out = float(fps_md)
+                        except Exception:
+                            pass
+                        frame_np = reader.get_data(int(video_frame))
+                except Exception as e:
+                    raise Exception(f"Unable to decode video frame {video_frame}: {e}")
 
-        if len(output_images) > 1:
-            image_tensor = torch.cat(output_images, dim=0)
-            mask_tensor = torch.cat(output_masks, dim=0)
+            frame_np = np.ascontiguousarray(frame_np)
+            if frame_np.ndim == 2:
+                frame_np = np.stack([frame_np] * 3, axis=-1)
+            image_tensor = torch.from_numpy(frame_np.astype(np.float32) / 255.0)[None,]
+            b, h, w, _ = image_tensor.shape
+            mask_tensor = torch.zeros((b, 1, h, w), dtype=torch.float32, device="cpu")
         else:
-            image_tensor = output_images[0]
-            mask_tensor = output_masks[0]
+            # Image mode: load from file path (supports GIF via ImageSequence)
+            image_path = folder_paths.get_annotated_filepath(image)
+            pil_img = Image.open(image_path)
+            
+            output_images, output_masks = [], []
+            for i in ImageSequence.Iterator(pil_img):
+                i = ImageOps.exif_transpose(i)
+                if i.mode == 'I':
+                    i = i.point(lambda i: i * (1 / 255))
+                image_tensor_part = i.convert("RGB")
+                image_tensor_part = np.array(image_tensor_part).astype(np.float32) / 255.0
+                image_tensor_part = torch.from_numpy(image_tensor_part)[None,]
+                
+                if 'A' in i.getbands():
+                    mask_part = np.array(i.getchannel('A')).astype(np.float32) / 255.0
+                    mask_part = 1. - torch.from_numpy(mask_part)
+                else:
+                    mask_part = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+                
+                output_images.append(image_tensor_part)
+                output_masks.append(mask_part.unsqueeze(0))
+
+            if len(output_images) > 1:
+                image_tensor = torch.cat(output_images, dim=0)
+                mask_tensor = torch.cat(output_masks, dim=0)
+            else:
+                image_tensor = output_images[0]
+                mask_tensor = output_masks[0]
 
         # 2. Resize the image
         original_size = get_image_size(image_tensor)
@@ -216,12 +306,61 @@ class GeminiImageLoader:
         resized_img = img_to_resize.resize((new_width, new_height), resample=Image.Resampling(resample_filters[resampling]))
         resized_tensor = pil2tensor(resized_img)
 
-        # 3. Create image preview of the *resized* image
+        # 2b. If video mode and requested, prepare resized frames list (guarded to prevent hangs)
+        if load_mode == "video" and kwargs.get("emit_all_frames", False):
+            stride = max(1, int(kwargs.get("frame_stride", 1)))
+            max_keep = int(kwargs.get("max_frames", 0) or 0)
+            kept = 0
+            try:
+                import imageio.v2 as iio
+                with iio.get_reader(video_path) as reader_all:
+                    idx = 0
+                    for fr in reader_all:
+                        if idx % stride != 0:
+                            idx += 1
+                            continue
+                        fr = np.ascontiguousarray(fr)
+                        if fr.ndim == 2:
+                            fr = np.stack([fr] * 3, axis=-1)
+                        pil_fr = Image.fromarray(fr.astype(np.uint8)).convert("RGB")
+                        pil_fr = pil_fr.resize((new_width, new_height), resample=Image.Resampling(resample_filters[resampling]))
+                        all_frames_resized.append(pil2tensor(pil_fr))
+                        kept += 1
+                        if max_keep > 0 and kept >= max_keep:
+                            break
+                        idx += 1
+                if total_frames_out <= 1:
+                    total_frames_out = len(all_frames_resized)
+            except Exception:
+                try:
+                    import cv2
+                    cap_all = cv2.VideoCapture(video_path)
+                    idx = 0
+                    ok_all, fr_all = cap_all.read()
+                    while ok_all and fr_all is not None:
+                        if idx % stride == 0:
+                            fr_rgb = fr_all[:, :, ::-1]
+                            pil_fr = Image.fromarray(fr_rgb.astype(np.uint8)).convert("RGB")
+                            pil_fr = pil_fr.resize((new_width, new_height), resample=Image.Resampling(resample_filters[resampling]))
+                            all_frames_resized.append(pil2tensor(pil_fr))
+                            kept += 1
+                            if max_keep > 0 and kept >= max_keep:
+                                break
+                        idx += 1
+                        ok_all, fr_all = cap_all.read()
+                    cap_all.release()
+                    if total_frames_out <= 1:
+                        total_frames_out = len(all_frames_resized)
+                except Exception:
+                    all_frames_resized = []
+
+        # 3. Create image preview of the *resized* image (image mode only)
         results = []
-        (full_output_folder, filename, counter, subfolder, _) = folder_paths.get_save_image_path("GeminiLoader", self.output_dir)
-        file = f"{filename}_{counter:05}_.png"
-        resized_img.save(os.path.join(full_output_folder, file))
-        results.append({"filename": file, "subfolder": subfolder, "type": self.type})
+        if load_mode != "video":
+            (full_output_folder, filename, counter, subfolder, _) = folder_paths.get_save_image_path("GeminiLoader", self.output_dir)
+            file = f"{filename}_{counter:05}_.png"
+            resized_img.save(os.path.join(full_output_folder, file))
+            results.append({"filename": file, "subfolder": subfolder, "type": self.type})
 
         # 4. Select instructions and generate prompt
         instruction_map = NSFW_INSTRUCTIONS if nsfw else SFW_INSTRUCTIONS
@@ -260,14 +399,25 @@ class GeminiImageLoader:
             # Create an empty latent
             latent_output = {"samples": torch.zeros([1, 4, new_height // 8, new_width // 8])}
 
-        return {"ui": {"images": results}, "result": (resized_tensor, mask_tensor, generated_prompt, latent_output)}
+        # 7. Compose outputs, including video metadata and all frames (list)
+        frames_out = all_frames_resized if (load_mode == "video" and kwargs.get("emit_all_frames", False)) else ([resized_tensor] if load_mode != "video" else [])
+        return {"ui": {"images": results}, "result": (resized_tensor, mask_tensor, generated_prompt, latent_output, int(total_frames_out), float(fps_out), frames_out)}
 
     @classmethod
-    def IS_CHANGED(cls, image: str, model: str, prompt_style: str, nsfw: bool, max_size: int, upscale: str, resampling: str, vae=None, **kwargs):
-        image_path = folder_paths.get_annotated_filepath(image)
+    def IS_CHANGED(cls, load_mode: str, image: str, video: str | None, video_frame: int, model: str, prompt_style: str, nsfw: bool, max_size: int, upscale: str, resampling: str, vae=None, **kwargs):
         m = hashlib.sha256()
-        with open(image_path, 'rb') as f:
-            m.update(f.read())
+        if load_mode == "video" and video:
+            video_path = folder_paths.get_annotated_filepath(video)
+            try:
+                st = os.stat(video_path)
+                m.update(str(st.st_size).encode()); m.update(str(int(st.st_mtime)).encode())
+            except Exception:
+                m.update(video_path.encode())
+            m.update(str(int(video_frame)).encode())
+        else:
+            image_path = folder_paths.get_annotated_filepath(image)
+            with open(image_path, 'rb') as f:
+                m.update(f.read())
         # Also consider other params in cache invalidation
         m.update(model.encode())
         m.update(prompt_style.encode())
@@ -284,5 +434,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "GeminiImageLoader": "Gemini Image Loader & Prompter"
+    "GeminiImageLoader": "GEMINI LOADER/PROMPTER♊︎🔮"
 }

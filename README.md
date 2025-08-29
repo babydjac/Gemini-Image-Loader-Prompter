@@ -36,7 +36,7 @@ Prompts and previews:
    ```
 2. Clone this repository.
    ```bash
-   git clone https://github.com/babydjac/Gemini-Image-Loader-Prompter.git
+   git clone https://github.com/babydjac/Gemini-Loader-Prompter.git
    ```
 3. Install and configure `comfy_api_nodes` (required for Gemini access). See its README for API key configuration.
 4. Restart ComfyUI.
